@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: whiteboard-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: CLIENT_ORIGIN
+        sync: false   # Vercel の URL をデプロイ後に手動で設定
+      - key: NODE_ENV
+        value: production
