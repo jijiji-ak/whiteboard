@@ -55,9 +55,23 @@ io.on('connection', (socket) => {
     socket.broadcast.emit('draw', data);
   });
 
+  // clear only removes draw events; background image stays
   socket.on('clear', () => {
-    drawingHistory = [];
+    drawingHistory = drawingHistory.filter((e) => e.type !== 'draw');
     socket.broadcast.emit('clear');
+  });
+
+  socket.on('place_image', (base64) => {
+    if (typeof base64 !== 'string' || !base64.startsWith('data:image/')) return;
+    // Keep only the latest image event (replace previous)
+    drawingHistory = drawingHistory.filter((e) => e.type !== 'place_image');
+    drawingHistory.push({ type: 'place_image', data: base64 });
+    socket.broadcast.emit('place_image', base64);
+  });
+
+  socket.on('remove_bg', () => {
+    drawingHistory = drawingHistory.filter((e) => e.type !== 'place_image');
+    socket.broadcast.emit('remove_bg');
   });
 
   socket.on('disconnect', () => {

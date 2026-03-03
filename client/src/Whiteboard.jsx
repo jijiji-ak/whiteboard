@@ -3,7 +3,6 @@ import { io } from 'socket.io-client';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
-// Preset colors for quick access
 const PRESET_COLORS = [
   '#000000', '#ffffff', '#ef4444', '#f97316',
   '#eab308', '#22c55e', '#3b82f6', '#a855f7',
@@ -25,13 +24,15 @@ function getEventPos(e, canvas) {
 }
 
 export default function Whiteboard() {
-  const canvasRef = useRef(null);
+  const canvasRef = useRef(null);       // drawing layer (top, transparent bg)
+  const bgCanvasRef = useRef(null);     // background layer (bottom, white/image)
   const socketRef = useRef(null);
   const isDrawing = useRef(false);
   const lastPoint = useRef(null);
-  const localHistoryRef = useRef([]); // client-side history for resize redraw
+  const localHistoryRef = useRef([]);
+  const bgImageRef = useRef(null);      // current background image as base64
+  const fileInputRef = useRef(null);
 
-  // Use refs for values accessed inside event handlers to avoid stale closures
   const toolRef = useRef('pen');
   const colorRef = useRef('#000000');
   const lineWidthRef = useRef(4);
@@ -41,63 +42,103 @@ export default function Whiteboard() {
   const [lineWidth, setLineWidth] = useState(4);
   const [connected, setConnected] = useState(false);
   const [userCount, setUserCount] = useState(0);
+  const [hasBg, setHasBg] = useState(false);
 
-  // Keep refs in sync with state
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { colorRef.current = color; }, [color]);
   useEffect(() => { lineWidthRef.current = lineWidth; }, [lineWidth]);
 
+  // Render a single stroke segment onto the drawing canvas
   const renderSegment = useCallback((ctx, data) => {
     const { x0, y0, x1, y1, color: c, lineWidth: lw, tool: t } = data;
+    ctx.save();
     ctx.beginPath();
     ctx.moveTo(x0, y0);
     ctx.lineTo(x1, y1);
-    ctx.strokeStyle = t === 'eraser' ? '#ffffff' : c;
+    if (t === 'eraser') {
+      // destination-out makes pixels transparent, revealing the bg canvas below
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.strokeStyle = 'rgba(0,0,0,1)';
+    } else {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.strokeStyle = c;
+    }
     ctx.lineWidth = lw;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.stroke();
+    ctx.restore();
   }, []);
 
+  // Redraw entire drawing layer from local history
   const redrawAll = useCallback((ctx, canvas) => {
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     localHistoryRef.current.forEach((data) => renderSegment(ctx, data));
   }, [renderSegment]);
 
-  // Initialize canvas size and socket connection
+  // Draw image (or white fill) onto the background canvas
+  const drawBgImage = useCallback((base64) => {
+    const bgCanvas = bgCanvasRef.current;
+    if (!bgCanvas) return;
+    const bgCtx = bgCanvas.getContext('2d');
+    bgCtx.fillStyle = '#ffffff';
+    bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+    if (!base64) return;
+    const img = new Image();
+    img.onload = () => {
+      // Scale to fit while keeping aspect ratio, centered
+      const scale = Math.min(bgCanvas.width / img.width, bgCanvas.height / img.height);
+      const x = (bgCanvas.width - img.width * scale) / 2;
+      const y = (bgCanvas.height - img.height * scale) / 2;
+      bgCtx.drawImage(img, x, y, img.width * scale, img.height * scale);
+    };
+    img.src = base64;
+  }, []);
+
+  // Initialize canvases and socket
   useEffect(() => {
     const canvas = canvasRef.current;
+    const bgCanvas = bgCanvasRef.current;
     const ctx = canvas.getContext('2d');
 
-    const initCanvas = () => {
+    const initCanvases = () => {
       canvas.width = canvas.offsetWidth;
       canvas.height = canvas.offsetHeight;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      bgCanvas.width = bgCanvas.offsetWidth;
+      bgCanvas.height = bgCanvas.offsetHeight;
+      const bgCtx = bgCanvas.getContext('2d');
+      bgCtx.fillStyle = '#ffffff';
+      bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
     };
-    initCanvas();
+    initCanvases();
 
-    // On resize, redraw from local history instead of using getImageData/putImageData
-    // (putImageData clips content when canvas shrinks then grows back)
+    // On resize: resize both canvases and redraw each layer
     const observer = new ResizeObserver(() => {
+      bgCanvas.width = bgCanvas.offsetWidth;
+      bgCanvas.height = bgCanvas.offsetHeight;
+      drawBgImage(bgImageRef.current);
+
       canvas.width = canvas.offsetWidth;
       canvas.height = canvas.offsetHeight;
       redrawAll(ctx, canvas);
     });
     observer.observe(canvas);
 
-    // Connect to server
-    const socket = io(SERVER_URL, {
-      transports: ['websocket', 'polling'],
-    });
+    const socket = io(SERVER_URL, { transports: ['websocket', 'polling'] });
     socketRef.current = socket;
 
     socket.on('connect', () => setConnected(true));
     socket.on('disconnect', () => { setConnected(false); setUserCount(0); });
 
-    // Redraw full history when first joining
     socket.on('history', (history) => {
+      // Restore most recent background image if present
+      const imageEvent = [...history].reverse().find((e) => e.type === 'place_image');
+      if (imageEvent) {
+        bgImageRef.current = imageEvent.data;
+        setHasBg(true);
+        drawBgImage(imageEvent.data);
+      }
+      // Restore drawing history
       localHistoryRef.current = history
         .filter((e) => e.type === 'draw')
         .map(({ x0, y0, x1, y1, color, lineWidth, tool }) => ({ x0, y0, x1, y1, color, lineWidth, tool }));
@@ -109,10 +150,24 @@ export default function Whiteboard() {
       renderSegment(ctx, data);
     });
 
+    // clear only wipes drawing layer, not background
     socket.on('clear', () => {
       localHistoryRef.current = [];
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    });
+
+    socket.on('place_image', (base64) => {
+      bgImageRef.current = base64;
+      setHasBg(true);
+      drawBgImage(base64);
+    });
+
+    socket.on('remove_bg', () => {
+      bgImageRef.current = null;
+      setHasBg(false);
+      const bgCtx = bgCanvas.getContext('2d');
+      bgCtx.fillStyle = '#ffffff';
+      bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
     });
 
     socket.on('user_count', (count) => setUserCount(count));
@@ -121,7 +176,7 @@ export default function Whiteboard() {
       observer.disconnect();
       socket.disconnect();
     };
-  }, [renderSegment, redrawAll]);
+  }, [renderSegment, redrawAll, drawBgImage]);
 
   const startDrawing = useCallback((e) => {
     e.preventDefault();
@@ -160,13 +215,38 @@ export default function Whiteboard() {
     lastPoint.current = null;
   }, []);
 
+  // Clears only the drawing layer (background stays)
   const clearBoard = useCallback(() => {
     localHistoryRef.current = [];
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     socketRef.current?.emit('clear');
+  }, []);
+
+  const handleImageUpload = useCallback((e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target.result;
+      bgImageRef.current = base64;
+      setHasBg(true);
+      drawBgImage(base64);
+      socketRef.current?.emit('place_image', base64);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = ''; // allow re-uploading the same file
+  }, [drawBgImage]);
+
+  const removeBg = useCallback(() => {
+    bgImageRef.current = null;
+    setHasBg(false);
+    const bgCanvas = bgCanvasRef.current;
+    const bgCtx = bgCanvas.getContext('2d');
+    bgCtx.fillStyle = '#ffffff';
+    bgCtx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
+    socketRef.current?.emit('remove_bg');
   }, []);
 
   return (
@@ -177,7 +257,6 @@ export default function Whiteboard() {
 
         <div style={styles.separator} />
 
-        {/* Tool selector */}
         <div style={styles.group}>
           {TOOLS.map(({ id, label }) => (
             <button
@@ -192,7 +271,6 @@ export default function Whiteboard() {
 
         <div style={styles.separator} />
 
-        {/* Preset colors */}
         <div style={styles.group}>
           {PRESET_COLORS.map((c) => (
             <button
@@ -207,7 +285,6 @@ export default function Whiteboard() {
               }}
             />
           ))}
-          {/* Custom color picker */}
           <input
             type="color"
             value={color}
@@ -219,29 +296,40 @@ export default function Whiteboard() {
 
         <div style={styles.separator} />
 
-        {/* Stroke size */}
         <div style={styles.group}>
           <label style={styles.label}>Size&nbsp;{lineWidth}px</label>
           <input
-            type="range"
-            min="1"
-            max="40"
-            value={lineWidth}
+            type="range" min="1" max="40" value={lineWidth}
             onChange={(e) => setLineWidth(Number(e.target.value))}
             style={styles.slider}
           />
         </div>
 
+        <div style={styles.separator} />
+
+        {/* Background image controls */}
+        <div style={styles.group}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={handleImageUpload}
+          />
+          <button onClick={() => fileInputRef.current?.click()} style={styles.toolBtn}>
+            Image
+          </button>
+          {hasBg && (
+            <button onClick={removeBg} style={{ ...styles.toolBtn, color: '#f38ba8', borderColor: '#f38ba8' }}>
+              Remove BG
+            </button>
+          )}
+        </div>
+
         <div style={{ flex: 1 }} />
 
-        {/* Connection status */}
         <div style={styles.group}>
-          <div
-            style={{
-              ...styles.dot,
-              background: connected ? '#4ade80' : '#ef4444',
-            }}
-          />
+          <div style={{ ...styles.dot, background: connected ? '#4ade80' : '#ef4444' }} />
           <span style={{ ...styles.label, color: connected ? '#4ade80' : '#ef4444' }}>
             {connected ? `Online${userCount > 0 ? ` (${userCount})` : ''}` : 'Offline'}
           </span>
@@ -254,22 +342,22 @@ export default function Whiteboard() {
         </button>
       </div>
 
-      {/* Canvas */}
-      <canvas
-        ref={canvasRef}
-        style={{
-          ...styles.canvas,
-          cursor: tool === 'eraser' ? 'cell' : 'crosshair',
-        }}
-        onMouseDown={startDrawing}
-        onMouseMove={draw}
-        onMouseUp={stopDrawing}
-        onMouseLeave={stopDrawing}
-        onTouchStart={startDrawing}
-        onTouchMove={draw}
-        onTouchEnd={stopDrawing}
-        onTouchCancel={stopDrawing}
-      />
+      {/* Canvas area: bg canvas (bottom) + drawing canvas (top) */}
+      <div style={styles.canvasWrapper}>
+        <canvas ref={bgCanvasRef} style={styles.bgCanvas} />
+        <canvas
+          ref={canvasRef}
+          style={{ ...styles.drawCanvas, cursor: tool === 'eraser' ? 'cell' : 'crosshair' }}
+          onMouseDown={startDrawing}
+          onMouseMove={draw}
+          onMouseUp={stopDrawing}
+          onMouseLeave={stopDrawing}
+          onTouchStart={startDrawing}
+          onTouchMove={draw}
+          onTouchEnd={stopDrawing}
+          onTouchCancel={stopDrawing}
+        />
+      </div>
     </div>
   );
 }
@@ -369,9 +457,23 @@ const styles = {
     fontSize: '13px',
     fontWeight: 600,
   },
-  canvas: {
+  canvasWrapper: {
     flex: 1,
-    display: 'block',
+    position: 'relative',
+  },
+  bgCanvas: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '100%',
+  },
+  drawCanvas: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '100%',
     touchAction: 'none',
   },
 };
