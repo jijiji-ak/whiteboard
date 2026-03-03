@@ -29,6 +29,7 @@ export default function Whiteboard() {
   const socketRef = useRef(null);
   const isDrawing = useRef(false);
   const lastPoint = useRef(null);
+  const localHistoryRef = useRef([]); // client-side history for resize redraw
 
   // Use refs for values accessed inside event handlers to avoid stale closures
   const toolRef = useRef('pen');
@@ -58,6 +59,12 @@ export default function Whiteboard() {
     ctx.stroke();
   }, []);
 
+  const redrawAll = useCallback((ctx, canvas) => {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    localHistoryRef.current.forEach((data) => renderSegment(ctx, data));
+  }, [renderSegment]);
+
   // Initialize canvas size and socket connection
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -71,14 +78,12 @@ export default function Whiteboard() {
     };
     initCanvas();
 
-    // Preserve drawing content on window resize
+    // On resize, redraw from local history instead of using getImageData/putImageData
+    // (putImageData clips content when canvas shrinks then grows back)
     const observer = new ResizeObserver(() => {
-      const saved = ctx.getImageData(0, 0, canvas.width, canvas.height);
       canvas.width = canvas.offsetWidth;
       canvas.height = canvas.offsetHeight;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.putImageData(saved, 0, 0);
+      redrawAll(ctx, canvas);
     });
     observer.observe(canvas);
 
@@ -93,16 +98,19 @@ export default function Whiteboard() {
 
     // Redraw full history when first joining
     socket.on('history', (history) => {
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      history.forEach((event) => {
-        if (event.type === 'draw') renderSegment(ctx, event);
-      });
+      localHistoryRef.current = history
+        .filter((e) => e.type === 'draw')
+        .map(({ x0, y0, x1, y1, color, lineWidth, tool }) => ({ x0, y0, x1, y1, color, lineWidth, tool }));
+      redrawAll(ctx, canvas);
     });
 
-    socket.on('draw', (data) => renderSegment(ctx, data));
+    socket.on('draw', (data) => {
+      localHistoryRef.current.push(data);
+      renderSegment(ctx, data);
+    });
 
     socket.on('clear', () => {
+      localHistoryRef.current = [];
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     });
@@ -113,7 +121,7 @@ export default function Whiteboard() {
       observer.disconnect();
       socket.disconnect();
     };
-  }, [renderSegment]);
+  }, [renderSegment, redrawAll]);
 
   const startDrawing = useCallback((e) => {
     e.preventDefault();
@@ -140,6 +148,7 @@ export default function Whiteboard() {
       tool: toolRef.current,
     };
 
+    localHistoryRef.current.push(data);
     renderSegment(ctx, data);
     socketRef.current?.emit('draw', data);
     lastPoint.current = current;
@@ -152,6 +161,7 @@ export default function Whiteboard() {
   }, []);
 
   const clearBoard = useCallback(() => {
+    localHistoryRef.current = [];
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#ffffff';
